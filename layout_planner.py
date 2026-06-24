@@ -95,6 +95,15 @@ class RouteSegment:
         return [(c, self.y1) for c in range(self.x1, self.x2 + 1)]
 
 
+class ComponentGroup:
+    _id_counter = 0
+
+    def __init__(self, members):
+        ComponentGroup._id_counter += 1
+        self.gid     = ComponentGroup._id_counter
+        self.members = list(members)
+
+
 # ─── Parser ───────────────────────────────────────────────────────────────────
 
 def parse_netlist(text):
@@ -311,6 +320,10 @@ class LayoutApp:
         self._drag_comp   = None
         self._drag_off    = (0, 0)
         self._drag_moved  = False
+        self._selected_comp  = None
+        self._selected_group = None
+        self._multi_sel      = set()   # shift+click による複数選択候補
+        self._groups         = []      # ComponentGroup のリスト
 
         self._build_ui()
         self._load_text(DEMO_NETLIST)
@@ -344,6 +357,25 @@ class LayoutApp:
         self._net_list = tk.Listbox(left, width=22, font=('Courier', 9))
         self._net_list.pack(fill=tk.BOTH, expand=True)
         self._net_list.bind('<<ListboxSelect>>', self._on_net_select)
+
+        ttk.Separator(left, orient='horizontal').pack(fill='x', pady=4)
+
+        # ── 回転・反転ボタン ──
+        self._sel_label = ttk.Label(left, text="選択素子: なし",
+                                    font=('Arial', 8), foreground='#888888')
+        self._sel_label.pack(anchor='w')
+        btn_frame = ttk.Frame(left)
+        btn_frame.pack(fill='x', pady=2)
+        ttk.Button(btn_frame, text="↺ 左90°",
+                   command=self._rotate_left).grid(row=0, column=0, padx=1, pady=1, sticky='ew')
+        ttk.Button(btn_frame, text="↻ 右90°",
+                   command=self._rotate_right).grid(row=0, column=1, padx=1, pady=1, sticky='ew')
+        ttk.Button(btn_frame, text="⇔ 左右反転",
+                   command=self._flip_h).grid(row=1, column=0, padx=1, pady=1, sticky='ew')
+        ttk.Button(btn_frame, text="↕ 上下反転",
+                   command=self._flip_v).grid(row=1, column=1, padx=1, pady=1, sticky='ew')
+        btn_frame.columnconfigure(0, weight=1)
+        btn_frame.columnconfigure(1, weight=1)
 
         ttk.Separator(left, orient='horizontal').pack(fill='x', pady=4)
         ttk.Label(left, text="Grid (px):").pack(anchor='w')
@@ -826,9 +858,26 @@ class LayoutApp:
             px, py = self._g2p(comp.gx, comp.gy)
             pw, ph = comp.width * gs, comp.height * gs
 
+            is_sel      = (comp is self._selected_comp)
+            in_multi    = (comp in self._multi_sel)
+            grp         = self._comp_group(comp)
+            in_sel_grp  = (grp is not None and grp is self._selected_group)
+
+            if is_sel:
+                outline_color = '#ffff00'
+                outline_width = 3
+            elif in_multi:
+                outline_color = '#00ffff'
+                outline_width = 3
+            elif in_sel_grp:
+                outline_color = '#ffaa00'
+                outline_width = 2
+            else:
+                outline_color = '#ccccdd'
+                outline_width = 2
             comp.rect_id = self.canvas.create_rectangle(
                 px, py, px+pw, py+ph,
-                fill='#1a1a40', outline='#ccccdd', width=2,
+                fill='#1a1a40', outline=outline_color, width=outline_width,
                 tags=('comp', f'comp_{comp.inst_name}'))
             self.canvas.create_text(px+pw/2, py+ph/2 - 7,
                 text=comp.inst_name, fill='#ffffff',
@@ -855,6 +904,28 @@ class LayoutApp:
                     self.canvas.create_text(ppx+ox, ppy+oy, text=nn,
                         fill='#ffbbbb', font=('Arial', 6), tags='comp')
 
+        # グループの破線枠を描画
+        mg = max(4, gs // 6)   # pixel margin around group bbox
+        for grp in self._groups:
+            rx1 = min(c.gx for c in grp.members)
+            ry1 = min(c.gy for c in grp.members)
+            rx2 = max(c.gx + c.width  for c in grp.members)
+            ry2 = max(c.gy + c.height for c in grp.members)
+            px1, py1 = self._g2p(rx1, ry1)
+            px2, py2 = self._g2p(rx2, ry2)
+            px1 -= mg; py1 -= mg
+            px2 += mg; py2 += mg
+            is_sel_grp = (grp is self._selected_group)
+            color = '#ffaa00' if is_sel_grp else '#7788cc'
+            lw    = 2 if is_sel_grp else 1
+            self.canvas.create_rectangle(
+                px1, py1, px2, py2,
+                outline=color, width=lw, dash=(8, 4),
+                fill='', tags=('comp', f'group_{grp.gid}'))
+            self.canvas.create_text(
+                px1 + 4, py1 + 4, text=f"G{grp.gid}",
+                anchor='nw', fill=color, font=('Arial', 7, 'bold'), tags='comp')
+
     # ── interaction ──────────────────────────────────────────────────────────
 
     def _canvas_xy(self, event):
@@ -875,6 +946,40 @@ class LayoutApp:
     def _on_click(self, event):
         cx, cy = self._canvas_xy(event)
         comp = self._comp_at(cx, cy)
+
+        if event.state & 0x1:  # Shift キー押下 → 複数選択
+            if comp:
+                if comp in self._multi_sel:
+                    self._multi_sel.discard(comp)
+                else:
+                    self._multi_sel.add(comp)
+                self._selected_comp  = None
+                self._selected_group = None
+                names = ", ".join(c.inst_name for c in self._multi_sel)
+                self._sel_label.config(
+                    text=f"複数選択: {names}" if names else "選択: なし")
+                self._draw_components()
+            return
+
+        # 通常クリック
+        self._multi_sel.clear()
+        grp = self._comp_group(comp) if comp else None
+
+        prev_comp = self._selected_comp
+        prev_grp  = self._selected_group
+        self._selected_comp  = comp if grp is None else None
+        self._selected_group = grp
+
+        if self._selected_comp != prev_comp or self._selected_group != prev_grp:
+            if grp:
+                label = f"グループG{grp.gid} ({len(grp.members)}素子)"
+            elif comp:
+                label = comp.inst_name
+            else:
+                label = "なし"
+            self._sel_label.config(text=f"選択: {label}")
+            self._draw_components()
+
         if comp:
             gs = self.grid_px
             self._drag_comp  = comp
@@ -889,8 +994,16 @@ class LayoutApp:
         new_gx = max(0, round((cx - self._drag_off[0]) / gs))
         new_gy = max(0, round((cy - self._drag_off[1]) / gs))
         if new_gx != self._drag_comp.gx or new_gy != self._drag_comp.gy:
-            self._drag_comp.gx = new_gx
-            self._drag_comp.gy = new_gy
+            grp = self._comp_group(self._drag_comp)
+            if grp:
+                dgx = new_gx - self._drag_comp.gx
+                dgy = new_gy - self._drag_comp.gy
+                for c in grp.members:
+                    c.gx = max(0, c.gx + dgx)
+                    c.gy = max(0, c.gy + dgy)
+            else:
+                self._drag_comp.gx = new_gx
+                self._drag_comp.gy = new_gy
             self._drag_moved = True
             self._route_all()
             self.redraw()
@@ -908,6 +1021,9 @@ class LayoutApp:
                 if net_name and net_name in self.nets:
                     self._wire_menu(event, net_name)
                     return
+        comp = self._comp_at(cx, cy)
+        if comp:
+            self._comp_menu(event, comp)
 
     def _wire_menu(self, event, net_name):
         net = self.nets[net_name]
@@ -944,6 +1060,68 @@ class LayoutApp:
                          command=lambda: self._toggle_power_ring(net_name))
 
         menu.tk_popup(event.x_root, event.y_root)
+
+    # ── group menu ───────────────────────────────────────────────────────────
+
+    def _comp_menu(self, event, comp):
+        menu = tk.Menu(self.root, tearoff=0)
+        grp = self._comp_group(comp)
+
+        if grp:
+            menu.add_command(
+                label=f"グループ G{grp.gid}（{len(grp.members)}素子）",
+                state=tk.DISABLED)
+            menu.add_separator()
+            menu.add_command(label="グループ解除",
+                             command=lambda: self._disband_group(grp))
+        else:
+            if len(self._multi_sel) >= 2:
+                n = len(self._multi_sel)
+                menu.add_command(
+                    label=f"選択中の {n} 素子をグループ化",
+                    command=self._create_group)
+            else:
+                menu.add_command(
+                    label=f"素子: {comp.inst_name}", state=tk.DISABLED)
+                menu.add_separator()
+                menu.add_command(
+                    label="Shift+クリックで複数選択してグループ化できます",
+                    state=tk.DISABLED)
+
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _comp_group(self, comp):
+        if comp is None:
+            return None
+        for grp in self._groups:
+            if comp in grp.members:
+                return grp
+        return None
+
+    def _create_group(self):
+        if len(self._multi_sel) < 2:
+            return
+        # 既存グループに属する素子は一旦除外してシンプルに新規グループ化
+        members = [c for c in self._multi_sel if self._comp_group(c) is None]
+        if len(members) < 2:
+            self._status.set("グループ化できる素子が2つ以上必要です")
+            return
+        grp = ComponentGroup(members)
+        self._groups.append(grp)
+        self._multi_sel.clear()
+        self._selected_comp  = None
+        self._selected_group = grp
+        self._sel_label.config(text=f"選択: グループG{grp.gid} ({len(grp.members)}素子)")
+        self._draw_components()
+        self._status.set(f"グループ G{grp.gid} 作成（{len(grp.members)}素子）")
+
+    def _disband_group(self, grp):
+        self._groups.remove(grp)
+        if self._selected_group is grp:
+            self._selected_group = None
+        self._sel_label.config(text="選択: なし")
+        self._draw_components()
+        self._status.set(f"グループ G{grp.gid} を解除しました")
 
     def _set_priority(self, net_name):
         v = simpledialog.askinteger("優先度設定",
@@ -985,6 +1163,88 @@ class LayoutApp:
         self._reroute_and_redraw()
         state = "有効（パワーリング）" if net.is_power_ring else "無効（通常配線）"
         self._status.set(f"Net '{net_name}' → {state}")
+
+    # ── component / group transform ──────────────────────────────────────────
+
+    def _apply_side_map(self, comp, mapping):
+        for pd in comp.pin_defs.values():
+            pd.side = mapping[pd.side]
+
+    def _transform_group(self, grp, op):
+        """グループ内の全素子を op に従って回転・反転する。"""
+        rx1 = min(c.gx for c in grp.members)
+        ry1 = min(c.gy for c in grp.members)
+        rx2 = max(c.gx + c.width  for c in grp.members)
+        ry2 = max(c.gy + c.height for c in grp.members)
+        GW  = rx2 - rx1
+        GH  = ry2 - ry1
+
+        for comp in grp.members:
+            dx, dy = comp.gx - rx1, comp.gy - ry1
+            w,  h  = comp.width, comp.height
+
+            if op == 'rotate_left':     # CCW: right→top
+                comp.gx = rx1 + dy
+                comp.gy = ry1 + (GW - dx - w)
+                comp.width, comp.height = h, w
+                self._apply_side_map(comp, {'N': 'W', 'W': 'S', 'S': 'E', 'E': 'N'})
+            elif op == 'rotate_right':  # CW: right→bottom
+                comp.gx = rx1 + (GH - dy - h)
+                comp.gy = ry1 + dx
+                comp.width, comp.height = h, w
+                self._apply_side_map(comp, {'N': 'E', 'E': 'S', 'S': 'W', 'W': 'N'})
+            elif op == 'flip_h':
+                comp.gx = rx1 + (GW - dx - w)
+                self._apply_side_map(comp, {'E': 'W', 'W': 'E', 'N': 'N', 'S': 'S'})
+            elif op == 'flip_v':
+                comp.gy = ry1 + (GH - dy - h)
+                self._apply_side_map(comp, {'N': 'S', 'S': 'N', 'E': 'E', 'W': 'W'})
+
+    def _rotate_left(self):
+        if self._selected_group:
+            self._transform_group(self._selected_group, 'rotate_left')
+            self._status.set(f"グループG{self._selected_group.gid} を左90°回転")
+            self._reroute_and_redraw()
+        elif self._selected_comp:
+            comp = self._selected_comp
+            self._apply_side_map(comp, {'N': 'W', 'W': 'S', 'S': 'E', 'E': 'N'})
+            comp.width, comp.height = comp.height, comp.width
+            self._status.set(f"{comp.inst_name} を左90°回転")
+            self._reroute_and_redraw()
+
+    def _rotate_right(self):
+        if self._selected_group:
+            self._transform_group(self._selected_group, 'rotate_right')
+            self._status.set(f"グループG{self._selected_group.gid} を右90°回転")
+            self._reroute_and_redraw()
+        elif self._selected_comp:
+            comp = self._selected_comp
+            self._apply_side_map(comp, {'N': 'E', 'E': 'S', 'S': 'W', 'W': 'N'})
+            comp.width, comp.height = comp.height, comp.width
+            self._status.set(f"{comp.inst_name} を右90°回転")
+            self._reroute_and_redraw()
+
+    def _flip_h(self):
+        if self._selected_group:
+            self._transform_group(self._selected_group, 'flip_h')
+            self._status.set(f"グループG{self._selected_group.gid} を左右反転")
+            self._reroute_and_redraw()
+        elif self._selected_comp:
+            comp = self._selected_comp
+            self._apply_side_map(comp, {'E': 'W', 'W': 'E', 'N': 'N', 'S': 'S'})
+            self._status.set(f"{comp.inst_name} を左右反転")
+            self._reroute_and_redraw()
+
+    def _flip_v(self):
+        if self._selected_group:
+            self._transform_group(self._selected_group, 'flip_v')
+            self._status.set(f"グループG{self._selected_group.gid} を上下反転")
+            self._reroute_and_redraw()
+        elif self._selected_comp:
+            comp = self._selected_comp
+            self._apply_side_map(comp, {'N': 'S', 'S': 'N', 'E': 'E', 'W': 'W'})
+            self._status.set(f"{comp.inst_name} を上下反転")
+            self._reroute_and_redraw()
 
     def _check_layer_conflicts(self):
         """
