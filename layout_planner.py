@@ -557,11 +557,12 @@ class LayoutApp:
     def _rebuild_net_list(self):
         self._net_list.delete(0, tk.END)
         for name, net in sorted(self.nets.items()):
-            prio  = f"P{net.priority}" if net.priority is not None else ""
-            layer = f"M{net.forced_layer+1}" if net.forced_layer is not None else ""
-            ring  = "Ring" if net.is_power_ring else ""
-            badge = " ".join(filter(None, [ring, prio, layer]))
-            label = f"{name}" + (f" [{badge}]" if badge else "")
+            prio   = f"P{net.priority}" if net.priority is not None else ""
+            layer  = f"M{net.forced_layer+1}" if net.forced_layer is not None else ""
+            ring   = "Ring" if net.is_power_ring else ""
+            badge  = " ".join(filter(None, [ring, prio, layer]))
+            length = sum(s.length() for s in net.segments)
+            label  = f"{name} ({length})" + (f" [{badge}]" if badge else "")
             self._net_list.insert(tk.END, label)
 
     def _on_net_select(self, _):
@@ -1107,8 +1108,7 @@ class LayoutApp:
                 self._drag_comp.gx = new_gx
                 self._drag_comp.gy = new_gy
             self._drag_moved = True
-            self._route_all()
-            self.redraw()
+            self._reroute_and_redraw()
 
     def _on_release(self, event):
         self._drag_comp = None
