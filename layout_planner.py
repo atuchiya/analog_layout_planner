@@ -15,6 +15,10 @@ POWER_NET_RE = re.compile(
 def is_power_net_name(name):
     return bool(POWER_NET_RE.match(name))
 
+# サブサーキットポート（トップレベル I/O ピン）インスタンスの一辺サイズ（グリッド単位）
+# ピン自体は実体を持たないため，操作性を損なわない範囲でできるだけ小さくする
+PORT_SIZE = 1
+
 # ─── Data Model ──────────────────────────────────────────────────────────────
 
 class PinDef:
@@ -25,13 +29,15 @@ class PinDef:
 
 
 class Component:
-    def __init__(self, inst_name, subckt, net_names, pin_defs, width, height):
+    def __init__(self, inst_name, subckt, net_names, pin_defs, width, height,
+                 is_port=False):
         self.inst_name = inst_name   # 'X1'
         self.subckt    = subckt      # 'NAND2'
         self.net_names = net_names   # ordered list of net names
         self.pin_defs  = pin_defs    # dict net_name→PinDef
         self.width     = width       # grid units
         self.height    = height      # grid units
+        self.is_port   = is_port     # True: サブサーキットの I/O ピン（.subckt 宣言）
         self.gx = 0
         self.gy = 0
         self.rect_id  = None
@@ -78,13 +84,14 @@ class Net:
 
 
 class RouteSegment:
-    def __init__(self, x1, y1, x2, y2, layer, net_name):
+    def __init__(self, x1, y1, x2, y2, layer, net_name, kind='wire'):
         if x1 > x2 or (x1 == x2 and y1 > y2):
             x1, y1, x2, y2 = x2, y2, x1, y1
         self.x1, self.y1 = x1, y1
         self.x2, self.y2 = x2, y2
         self.layer    = layer
         self.net_name = net_name
+        self.kind     = kind   # 'wire' | 'power_ring'（パワーリング本体）
 
     def length(self):
         return (self.x2 - self.x1) + (self.y2 - self.y1)
@@ -106,13 +113,38 @@ class ComponentGroup:
 
 # ─── Parser ───────────────────────────────────────────────────────────────────
 
+SUBCKT_RE = re.compile(r'^\.subckt\s+(\S+)(.*)$', re.IGNORECASE)
+ENDS_RE   = re.compile(r'^\.ends\b', re.IGNORECASE)
+
+
 def parse_netlist(text):
+    """
+    .subckt name pin1 pin2 ...
+    Xxxx ...
+    .ends
+    形式のネットリストを解析する。
+    戻り値: (components, nets, subckt_name)
+      components には .subckt 宣言のピンに対応するポートインスタンス
+      （is_port=True の Component）も含まれる。
+    """
     components = []
     nets = {}
+    subckt_name = None
+    port_names  = []
 
     for raw in text.splitlines():
         line = raw.strip()
-        if not line or line[0] in ('*', '.', '$'):
+        if not line:
+            continue
+
+        m = SUBCKT_RE.match(line)
+        if m:
+            subckt_name = m.group(1)
+            port_names  = m.group(2).split()
+            continue
+        if ENDS_RE.match(line):
+            continue
+        if line[0] in ('*', '.', '$'):
             continue
 
         comment = ''
@@ -166,7 +198,22 @@ def parse_netlist(text):
                 nets[nn] = Net(nn)
             nets[nn].connections.append((comp, nn))
 
-    return components, nets
+    # ── サブサーキットのピン（トップレベル I/O）を配置可能なポートインスタンスとして生成 ──
+    port_components = []
+    for name in port_names:
+        # 電源ネット（VDD/GND 等）は電源リング自体が接続点になるため，
+        # 別途ピンインスタンスは置かない
+        if is_power_net_name(name):
+            continue
+        pin_defs = {name: PinDef(name, 'W', 'M1')}
+        pcomp = Component(name, name, [name], pin_defs,
+                           PORT_SIZE, PORT_SIZE, is_port=True)
+        port_components.append(pcomp)
+        if name not in nets:
+            nets[name] = Net(name)
+        nets[name].connections.append((pcomp, name))
+
+    return port_components + components, nets, subckt_name
 
 
 # ─── Placement ───────────────────────────────────────────────────────────────
@@ -184,25 +231,33 @@ def initial_placement(components, gap=3, cols=4):
 
 # ─── A* Router ───────────────────────────────────────────────────────────────
 
-def astar_route(src, src_layer, dst, dst_layer, blocked3d, num_layers, max_c, max_r,
+def astar_route(sources, dst, dst_layer, blocked3d, num_layers, max_c, max_r,
                 forced_layer=None):
     """
     Route on layered grid.  blocked3d = set of (col,row,layer_idx).
+    sources = [(col,row,layer), …] — マルチソース A*。全点を g=0 の開始点として
+    扱うため，既存の配線ツリーの任意のセルから最短距離で分岐できる
+    （スター配線による遠回りを避けるため）。単一始点の場合は要素1個のリストを渡す。
     If forced_layer is set (int), routing is confined to that single layer (no vias).
     Returns path [(col,row,layer), …] or None.
     """
-    sc, sr = src; dc, dr = dst
+    dc, dr = dst
 
-    # When a layer is forced, override src/dst layers
+    # When a layer is forced, override source/dst layers
     if forced_layer is not None:
-        src_layer = dst_layer = forced_layer
+        dst_layer = forced_layer
+        sources = [(c, r, forced_layer) for (c, r, _l) in sources]
 
     def h(c, r): return abs(c - dc) + abs(r - dr)
 
-    start = (sc, sr, src_layer)
-    open_h = [(h(sc, sr), 0, start)]
-    g_sc   = {start: 0}
-    prev   = {start: None}
+    open_h = []
+    g_sc   = {}
+    prev   = {}
+    for s in sources:
+        if s not in g_sc:
+            g_sc[s] = 0
+            prev[s] = None
+            heapq.heappush(open_h, (h(s[0], s[1]), 0, s))
     vis    = set()
     goal   = (dc, dr, dst_layer)
 
@@ -256,17 +311,17 @@ def path_to_segments(path, net_name):
 
 
 def merge_segments(segs):
-    """Merge collinear adjacent segments on the same layer/net into longer ones."""
+    """Merge collinear adjacent segments on the same layer/net/kind into longer ones."""
     if not segs: return segs
     by_key = defaultdict(list)
     for s in segs:
         if s.x1 == s.x2:  # vertical
-            by_key[('V', s.x1, s.layer, s.net_name)].append((s.y1, s.y2))
+            by_key[('V', s.x1, s.layer, s.net_name, s.kind)].append((s.y1, s.y2))
         else:              # horizontal
-            by_key[('H', s.y1, s.layer, s.net_name)].append((s.x1, s.x2))
+            by_key[('H', s.y1, s.layer, s.net_name, s.kind)].append((s.x1, s.x2))
 
     result = []
-    for (orient, fixed, layer, net_name), intervals in by_key.items():
+    for (orient, fixed, layer, net_name, kind), intervals in by_key.items():
         # merge overlapping/adjacent intervals
         intervals.sort()
         merged = [list(intervals[0])]
@@ -277,9 +332,9 @@ def merge_segments(segs):
                 merged.append([a, b])
         for a, b in merged:
             if orient == 'V':
-                result.append(RouteSegment(fixed, a, fixed, b, layer, net_name))
+                result.append(RouteSegment(fixed, a, fixed, b, layer, net_name, kind=kind))
             else:
-                result.append(RouteSegment(a, fixed, b, fixed, layer, net_name))
+                result.append(RouteSegment(a, fixed, b, fixed, layer, net_name, kind=kind))
     return result
 
 
@@ -287,10 +342,12 @@ def merge_segments(segs):
 
 DEMO_NETLIST = """\
 * Simple demo netlist
+.subckt DEMO_TOP VDD GND A E
 X1 VDD GND A B INV_X1 * W=6 H=4 VDD:N:M1 GND:S:M1 A:W:M1 B:E:M1
 X2 VDD GND B C INV_X1 * W=6 H=4 VDD:N:M1 GND:S:M1 B:W:M1 C:E:M1
 X3 VDD GND A C D NAND2_X1 * W=8 H=6 VDD:N:M2 GND:S:M1 A:W:M1 C:W:M2 D:E:M1
 X4 VDD GND D E BUF_X1 * W=6 H=4 VDD:N:M1 GND:S:M1 D:W:M1 E:E:M1
+.ends
 """
 
 DEFAULT_LAYER_COLORS = [
@@ -476,7 +533,7 @@ class LayoutApp:
         ttk.Button(dlg, text="Load", command=ok).pack(pady=4)
 
     def _load_text(self, text):
-        self.components, self.nets = parse_netlist(text)
+        self.components, self.nets, subckt_name = parse_netlist(text)
         if not self.components:
             messagebox.showinfo("Info", "No X-elements found in netlist.")
             return
@@ -487,9 +544,14 @@ class LayoutApp:
         initial_placement(self.components)
         self._rebuild_net_list()
         self._reroute_and_redraw()
+        self.root.title(
+            f"Analog Layout Planner — {subckt_name}" if subckt_name
+            else "Analog Layout Planner")
         power_count = sum(1 for n in self.nets.values() if n.is_power_ring)
+        port_count  = sum(1 for c in self.components if c.is_port)
+        gate_count  = len(self.components) - port_count
         self._status.set(
-            f"{len(self.components)} components, {len(self.nets)} nets "
+            f"{gate_count} components, {port_count} ports, {len(self.nets)} nets "
             f"({power_count} power rings) loaded.")
 
     def _rebuild_net_list(self):
@@ -664,30 +726,38 @@ class LayoutApp:
 
     def _route_astar(self, net, pins, blocked3d, nl, max_c, max_r):
         """
-        A* routing connecting all pins to pin[0], respecting net.forced_layer.
+        マルチソース A* で「成長するツリー」へピンを1本ずつ接続する
+        （Steiner ツリー風の枝分かれ配線）。
+        毎回固定のハブ（pins[0]）へ戻るスター配線ではなく，既存の配線ツリーの
+        任意のセルから分岐できるため，途中のピンで遠回りにならず配線長が短くなる。
         forced_layer で失敗した場合はレイヤー制約を外して再試行する。
         それでも失敗した場合はそのセグメントを未配線のままにする（短絡を生まない）。
         """
         segs = []
         fl   = net.forced_layer
+        eff  = self._blocked_for_net(net.name, blocked3d)
+
         x0, y0, l0 = pins[0]
-        eff = self._blocked_for_net(net.name, blocked3d)
+        tree_cells = {(x0, y0, l0)}   # ツリーに属する (col,row,layer) の集合
 
         for x1, y1, l1 in pins[1:]:
+            sources = list(tree_cells)
+
             # ── 第1試行: forced_layer を守って A* ──────────────────────────
-            path = astar_route((x0, y0), l0, (x1, y1), l1,
+            path = astar_route(sources, (x1, y1), l1,
                                eff, nl, max_c, max_r,
                                forced_layer=fl)
 
             if path is None and fl is not None:
                 # ── 第2試行: forced_layer 制約を外して A* ──────────────────
                 # （指定レイヤーが混雑している場合の救済）
-                path = astar_route((x0, y0), l0, (x1, y1), l1,
+                path = astar_route(sources, (x1, y1), l1,
                                    eff, nl, max_c, max_r,
                                    forced_layer=None)
 
             if path is not None:
                 segs.extend(path_to_segments(path, net.name))
+                tree_cells.update(path)
             # path が None のままなら短絡を避けるため未配線のまま
         return segs
 
@@ -713,11 +783,13 @@ class LayoutApp:
         ry2 =        max(c.gy + c.height  for c in self.components) + margin
 
         layer = f'M{layer_idx + 1}'
+        # ring_segs は kind='power_ring'（ピンに相当する特殊配線として二重線表示）
+        # コネクタ（各ピン→リング）は通常の kind='wire'（実線）のまま
         ring_segs = [
-            RouteSegment(rx1, ry1, rx2, ry1, layer, net.name),  # 上辺
-            RouteSegment(rx1, ry2, rx2, ry2, layer, net.name),  # 下辺
-            RouteSegment(rx1, ry1, rx1, ry2, layer, net.name),  # 左辺
-            RouteSegment(rx2, ry1, rx2, ry2, layer, net.name),  # 右辺
+            RouteSegment(rx1, ry1, rx2, ry1, layer, net.name, kind='power_ring'),  # 上辺
+            RouteSegment(rx1, ry2, rx2, ry2, layer, net.name, kind='power_ring'),  # 下辺
+            RouteSegment(rx1, ry1, rx1, ry2, layer, net.name, kind='power_ring'),  # 左辺
+            RouteSegment(rx2, ry1, rx2, ry2, layer, net.name, kind='power_ring'),  # 右辺
         ]
 
         # リングセル集合（コネクタ routing 時は blocked3d から除外して通行可）
@@ -743,7 +815,7 @@ class LayoutApp:
 
             # A* でコネクタを引く（レイヤー固定）
             path = astar_route(
-                (px, py), layer_idx, (cx, cy), layer_idx,
+                [(px, py, layer_idx)], (cx, cy), layer_idx,
                 passable_blocked, self.num_layers, max_c, max_r,
                 forced_layer=layer_idx)
 
@@ -822,15 +894,32 @@ class LayoutApp:
 
         for layer_idx in sorted(by_layer.keys()):
             for net, seg in by_layer[layer_idx]:
-                color     = self._layer_color(seg.layer)
-                is_ring   = net.is_power_ring
-                linewidth = 5 if is_ring else 3
+                color  = self._layer_color(seg.layer)
                 x1, y1 = self._g2p(seg.x1, seg.y1)
                 x2, y2 = self._g2p(seg.x2, seg.y2)
-                self.canvas.create_line(
-                    x1, y1, x2, y2, fill=color, width=linewidth,
-                    capstyle=tk.ROUND,
-                    tags=('wire', f'wire_net_{net.name}', f'layer_{seg.layer}'))
+                tags   = ('wire', f'wire_net_{net.name}', f'layer_{seg.layer}')
+
+                if seg.kind == 'power_ring':
+                    # パワーリング本体: ピンに相当する特殊な配線であることを示すため
+                    # 少し太めの二重線で表示する（コネクタ配線は通常どおり実線）
+                    linewidth = 3
+                    gap = 4
+                    if seg.x1 == seg.x2:   # 垂直辺 → 左右にオフセット
+                        for ox in (-gap, gap):
+                            self.canvas.create_line(
+                                x1+ox, y1, x2+ox, y2, fill=color, width=linewidth,
+                                capstyle=tk.ROUND, tags=tags)
+                    else:                  # 水平辺 → 上下にオフセット
+                        for oy in (-gap, gap):
+                            self.canvas.create_line(
+                                x1, y1+oy, x2, y2+oy, fill=color, width=linewidth,
+                                capstyle=tk.ROUND, tags=tags)
+                else:
+                    linewidth = 5 if net.is_power_ring else 3
+                    self.canvas.create_line(
+                        x1, y1, x2, y2, fill=color, width=linewidth,
+                        capstyle=tk.ROUND, tags=tags)
+
                 lbl = str(seg.length())
                 mx, my = (x1 + x2) / 2, (y1 + y2) / 2
                 self.canvas.create_text(mx, my - 7, text=lbl,
@@ -875,16 +964,22 @@ class LayoutApp:
             else:
                 outline_color = '#ccccdd'
                 outline_width = 2
-            comp.rect_id = self.canvas.create_rectangle(
-                px, py, px+pw, py+ph,
-                fill='#1a1a40', outline=outline_color, width=outline_width,
-                tags=('comp', f'comp_{comp.inst_name}'))
-            self.canvas.create_text(px+pw/2, py+ph/2 - 7,
-                text=comp.inst_name, fill='#ffffff',
-                font=('Arial', 9, 'bold'), tags='comp')
-            self.canvas.create_text(px+pw/2, py+ph/2 + 9,
-                text=comp.subckt, fill='#aaaaff',
-                font=('Arial', 8), tags='comp')
+            if comp.is_port:
+                comp.rect_id = self.canvas.create_rectangle(
+                    px, py, px+pw, py+ph,
+                    fill='#4d3f0a', outline=outline_color, width=outline_width,
+                    tags=('comp', 'port', f'comp_{comp.inst_name}'))
+            else:
+                comp.rect_id = self.canvas.create_rectangle(
+                    px, py, px+pw, py+ph,
+                    fill='#1a1a40', outline=outline_color, width=outline_width,
+                    tags=('comp', f'comp_{comp.inst_name}'))
+                self.canvas.create_text(px+pw/2, py+ph/2 - 7,
+                    text=comp.inst_name, fill='#ffffff',
+                    font=('Arial', 9, 'bold'), tags='comp')
+                self.canvas.create_text(px+pw/2, py+ph/2 + 9,
+                    text=comp.subckt, fill='#aaaaff',
+                    font=('Arial', 8), tags='comp')
 
             comp.pin_ids = {}
             for nn in comp.net_names:
@@ -896,13 +991,20 @@ class LayoutApp:
                     fill='#e74c3c', outline='#ffffff', width=1,
                     tags=('comp', 'pin', f'comp_{comp.inst_name}'))
                 comp.pin_ids[nn] = pid
-                if gs >= 20:
+                # ポートは常にピン名を横に表示（本体がラベルなので必須）
+                if comp.is_port or gs >= 20:
                     side = comp.pin_defs[nn].side if nn in comp.pin_defs else 'N'
                     offsets = {'N': (0,-PIN-6), 'S': (0,PIN+6),
                                'W': (-PIN-6,0), 'E': (PIN+6,0)}
                     ox, oy = offsets.get(side, (0, -PIN-6))
-                    self.canvas.create_text(ppx+ox, ppy+oy, text=nn,
-                        fill='#ffbbbb', font=('Arial', 6), tags='comp')
+                    if comp.is_port:
+                        anchor = {'N': 's', 'S': 'n', 'W': 'e', 'E': 'w'}.get(side, 'center')
+                        self.canvas.create_text(ppx+ox, ppy+oy, text=nn,
+                            fill='#ffee88', font=('Arial', 9, 'bold'),
+                            anchor=anchor, tags='comp')
+                    else:
+                        self.canvas.create_text(ppx+ox, ppy+oy, text=nn,
+                            fill='#ffbbbb', font=('Arial', 6), tags='comp')
 
         # グループの破線枠を描画
         mg = max(4, gs // 6)   # pixel margin around group bbox
@@ -974,7 +1076,7 @@ class LayoutApp:
             if grp:
                 label = f"グループG{grp.gid} ({len(grp.members)}素子)"
             elif comp:
-                label = comp.inst_name
+                label = f"ピン {comp.inst_name}" if comp.is_port else comp.inst_name
             else:
                 label = "なし"
             self._sel_label.config(text=f"選択: {label}")
@@ -1081,8 +1183,9 @@ class LayoutApp:
                     label=f"選択中の {n} 素子をグループ化",
                     command=self._create_group)
             else:
+                kind = "ピン" if comp.is_port else "素子"
                 menu.add_command(
-                    label=f"素子: {comp.inst_name}", state=tk.DISABLED)
+                    label=f"{kind}: {comp.inst_name}", state=tk.DISABLED)
                 menu.add_separator()
                 menu.add_command(
                     label="Shift+クリックで複数選択してグループ化できます",
