@@ -81,6 +81,14 @@ class Net:
         self.forced_layer  = None # int layer index (0=M1) or None (auto)
         self.is_power_ring = False
         self.segments      = []   # [RouteSegment, …]
+        self.width_mult    = 1.0  # 配線幅倍率（デフォルト1倍。右クリックで設定）
+        self.terminal_paths = []  # [(Component, net_name, {layer_idx: length}, total_length), …]
+                                   # ルート(pins[0])を除く各端子までの経路のレイヤー別長さ内訳
+
+        # ネットリスト出力（T型等価回路への分解）用のツリー構造
+        self.tree_root_cell     = None  # (col,row,layer) ルートのセル
+        self.tree_parent        = {}    # (col,row,layer) -> 親セル（ルートは None）
+        self.tree_terminal_cells = {}   # (col,row,layer) -> (Component, net_name)
 
 
 class RouteSegment:
@@ -123,7 +131,9 @@ def parse_netlist(text):
     Xxxx ...
     .ends
     形式のネットリストを解析する。
-    戻り値: (components, nets, subckt_name)
+    戻り値: (components, nets, subckt_name, port_names)
+      port_names は .subckt 宣言のピン名を宣言順そのまま返す
+      （電源ネットも含む。ネットリスト再生成時の .subckt ヘッダ復元に使用）
       components には .subckt 宣言のピンに対応するポートインスタンス
       （is_port=True の Component）も含まれる。
     """
@@ -213,7 +223,7 @@ def parse_netlist(text):
             nets[name] = Net(name)
         nets[name].connections.append((pcomp, name))
 
-    return port_components + components, nets, subckt_name
+    return port_components + components, nets, subckt_name, port_names
 
 
 # ─── Placement ───────────────────────────────────────────────────────────────
@@ -338,6 +348,59 @@ def merge_segments(segs):
     return result
 
 
+# ─── ネットリスト出力用: 配線ツリーの分岐点分解 ──────────────────────────────
+
+def _find_branch_cells(parent):
+    """
+    parent: {(col,row,layer): 親セル（ルートは None）}
+    無向木としての次数が3以上のセル（分岐点）の集合を返す。
+    """
+    children = defaultdict(list)
+    for cell, p in parent.items():
+        if p is not None:
+            children[p].append(cell)
+
+    branch = set()
+    for cell in parent:
+        degree = len(children.get(cell, []))
+        if parent.get(cell) is not None:
+            degree += 1
+        if degree >= 3:
+            branch.add(cell)
+    return branch
+
+
+def _decompose_tree_edges(root_cell, parent, special_cells):
+    """
+    配線ツリーを「端子または分岐点（special_cells）どうしを結ぶ最小限の辺」に分解する。
+    各辺は T 型等価回路1個に対応する（端子から分岐点まで，分岐点から分岐点まで，等）。
+
+    戻り値: [(cellA, cellB, {layer_idx: length}, total_length), …]
+    """
+    children = defaultdict(list)
+    for cell, p in parent.items():
+        if p is not None:
+            children[p].append(cell)
+
+    edges = []
+    # スタック要素: (辺の始点セル, 現在セル, ここまでの累積長, レイヤー別累積長)
+    stack = [(root_cell, root_cell, 0, {})]
+    while stack:
+        anchor, cell, acc_len, acc_layer = stack.pop()
+        if cell in special_cells and cell != anchor:
+            edges.append((anchor, cell, acc_layer, acc_len))
+            anchor, acc_len, acc_layer = cell, 0, {}
+        for child in children.get(cell, []):
+            _, _, lyr1 = cell
+            _, _, lyr2 = child
+            nlen, nlayer = acc_len, dict(acc_layer)
+            if lyr1 == lyr2:
+                nlen += 1
+                nlayer[lyr1] = nlayer.get(lyr1, 0) + 1
+            stack.append((anchor, child, nlen, nlayer))
+    return edges
+
+
 # ─── Main Application ─────────────────────────────────────────────────────────
 
 DEMO_NETLIST = """\
@@ -359,6 +422,10 @@ DEFAULT_LAYER_COLORS = [
     '#1abc9c',  # M6 teal
 ]
 
+# 各レイヤーの1グリッド単位あたりの基準抵抗[mΩ] / 基準容量[fF]（デフォルト値）
+DEFAULT_LAYER_RESISTANCE = [50.0, 40.0, 30.0, 25.0, 20.0, 15.0]
+DEFAULT_LAYER_CAPACITANCE = [2.0, 1.5, 1.2, 1.0, 0.8, 0.6]
+
 
 class LayoutApp:
     def __init__(self, root):
@@ -368,11 +435,15 @@ class LayoutApp:
 
         self.grid_px    = 28          # pixels per grid unit
         self.num_layers = 3
-        self.layer_colors = list(DEFAULT_LAYER_COLORS)
+        self.layer_colors      = list(DEFAULT_LAYER_COLORS)
+        self.layer_resistance  = list(DEFAULT_LAYER_RESISTANCE)   # mΩ / グリッド単位
+        self.layer_capacitance = list(DEFAULT_LAYER_CAPACITANCE)  # fF / グリッド単位
         self.ring_margin  = 2         # grid units: gap between components and power ring
 
         self.components = []
         self.nets       = {}
+        self.subckt_name = None
+        self.port_names  = []
 
         self._drag_comp   = None
         self._drag_off    = (0, 0)
@@ -397,6 +468,9 @@ class LayoutApp:
 
         rm = tk.Menu(menubar, tearoff=0)
         rm.add_command(label="Re-route All", command=self._reroute_and_redraw)
+        rm.add_separator()
+        rm.add_command(label="配線結果をSPICEネットリスト出力…",
+                       command=self._export_netlist)
         menubar.add_cascade(label="Route", menu=rm)
 
         sm = tk.Menu(menubar, tearoff=0)
@@ -532,11 +606,38 @@ class LayoutApp:
             dlg.destroy()
         ttk.Button(dlg, text="Load", command=ok).pack(pady=4)
 
+    def _export_netlist(self):
+        text = self._generate_annotated_netlist()
+        dlg = tk.Toplevel(self.root)
+        dlg.title("配線結果ネットリスト（寄生RC付き）")
+        dlg.geometry("700x600")
+        t = tk.Text(dlg, font=('Courier', 10))
+        t.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        t.insert('1.0', text)
+
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(fill='x', pady=4)
+        ttk.Button(btn_frame, text="保存…",
+                  command=lambda: self._save_netlist_text(text)).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btn_frame, text="閉じる", command=dlg.destroy).pack(side=tk.LEFT, padx=6)
+
+    def _save_netlist_text(self, text):
+        path = filedialog.asksaveasfilename(
+            defaultextension='.sp',
+            filetypes=[('SPICE', '*.sp *.cir *.net *.spice *.spi'), ('All', '*.*')])
+        if not path:
+            return
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text)
+        self._status.set(f"ネットリストを保存しました: {path}")
+
     def _load_text(self, text):
-        self.components, self.nets, subckt_name = parse_netlist(text)
+        self.components, self.nets, subckt_name, port_names = parse_netlist(text)
         if not self.components:
             messagebox.showinfo("Info", "No X-elements found in netlist.")
             return
+        self.subckt_name = subckt_name
+        self.port_names  = port_names
         # パワーネットの自動検出
         for name, net in self.nets.items():
             if is_power_net_name(name):
@@ -554,23 +655,171 @@ class LayoutApp:
             f"{gate_count} components, {port_count} ports, {len(self.nets)} nets "
             f"({power_count} power rings) loaded.")
 
+    def _layer_res_value(self, layer_idx):
+        return (self.layer_resistance[layer_idx]
+                if layer_idx < len(self.layer_resistance) else 0.0)
+
+    def _layer_cap_value(self, layer_idx):
+        return (self.layer_capacitance[layer_idx]
+                if layer_idx < len(self.layer_capacitance) else 0.0)
+
+    def _net_capacitance(self, net):
+        """ネット全体の容量 [fF]（電源リング本体を除く配線セグメントの合計）。"""
+        total = 0.0
+        for seg in net.segments:
+            if seg.kind == 'power_ring':
+                continue
+            m = re.match(r'M(\d+)', seg.layer)
+            idx = int(m.group(1)) - 1 if m else 0
+            total += self._layer_cap_value(idx) * seg.length()
+        return total * net.width_mult
+
+    def _terminal_resistance(self, net, layer_len):
+        """ルートから1端子までの経路の抵抗 [mΩ]（layer_len: {layer_idx: length}）。"""
+        total = sum(self._layer_res_value(idx) * length
+                    for idx, length in layer_len.items())
+        return total / net.width_mult
+
+    def _edge_capacitance(self, net, layer_len):
+        """配線ツリーの1辺（端子-分岐点間など）の容量 [fF]（layer_len: {layer_idx: length}）。"""
+        total = sum(self._layer_cap_value(idx) * length
+                    for idx, length in layer_len.items())
+        return total * net.width_mult
+
+    def _generate_annotated_netlist(self):
+        """
+        現在の配置・配線結果を，配線寄生 R/C を T 型等価回路として追加した
+        SPICE ネットリストのテキストとして生成して返す。
+
+        ノード命名:
+          - 各ネットの「ルート」端子（.subckt ピンがあればそのポート，
+            なければ最初に接続された素子ピン）は，元のネット名をそのまま使う。
+          - それ以外の端子は，配線抵抗で元のネットから電気的に切り離されるため
+            "ネット名_素子名" という新しいノード名に張り替える。
+          - 分岐点（3方向以上に配線が分かれる点）は "ネット名_nK" という
+            新しいノードとして扱う。
+          - 電源リング（VDD/GND 等）はノード名を変更せず，R/C も追加しない。
+        単位: 抵抗は mΩ（SPICE の "m" 接尾辞），容量は fF（"f" 接尾辞）で出力する。
+        """
+        lines = []
+        if self.subckt_name:
+            lines.append(f".subckt {self.subckt_name} " + " ".join(self.port_names))
+
+        # ── 各端子（素子ピン）に割り当てる SPICE ノード名を決定 ──────────────
+        terminal_node_name = {}   # (Component, net_name) -> ノード名
+        for net in self.nets.values():
+            if net.is_power_ring or not net.tree_terminal_cells:
+                continue
+            root_cell = net.tree_root_cell
+            for cell, (comp, nn) in net.tree_terminal_cells.items():
+                if cell == root_cell:
+                    terminal_node_name[(comp, nn)] = net.name
+                else:
+                    terminal_node_name[(comp, nn)] = f"{net.name}_{comp.inst_name}"
+
+        # ── X 行を再構成（ポートインスタンスは実素子ではないため出力しない） ──
+        for comp in self.components:
+            if comp.is_port:
+                continue
+            conns = [terminal_node_name.get((comp, nn), nn) for nn in comp.net_names]
+            comment_bits = [f"W={comp.width}", f"H={comp.height}"]
+            for nn in comp.net_names:
+                pd = comp.pin_defs.get(nn)
+                if pd:
+                    comment_bits.append(f"{nn}:{pd.side}:{pd.layer}")
+            lines.append(
+                f"{comp.inst_name} " + " ".join(conns) + f" {comp.subckt}  * "
+                + " ".join(comment_bits))
+
+        # ── 配線寄生 R/C（T型等価回路）を .ends の手前に追記 ──────────────
+        lines.append("")
+        lines.append("* --- 配線寄生抵抗・容量（T型等価回路） ---")
+        lines.append("* 抵抗値は m 接尾辞(mΩ)，容量値は f 接尾辞(fF) で表記")
+
+        r_idx = 1
+        c_idx = 1
+        t_idx = 1
+        any_rc = False
+        for name, net in sorted(self.nets.items()):
+            if net.is_power_ring or not net.tree_parent:
+                continue
+            terminal_cells = net.tree_terminal_cells
+            branch_cells = _find_branch_cells(net.tree_parent)
+            special = set(terminal_cells.keys()) | branch_cells
+            edges = _decompose_tree_edges(net.tree_root_cell, net.tree_parent, special)
+            if not edges:
+                continue
+
+            any_rc = True
+            lines.append(f"* Net {name}")
+            branch_node_name = {}   # このネット内の分岐点セル -> ノード名
+
+            def node_of(cell, _tc=terminal_cells, _bn=branch_node_name, _name=name):
+                if cell in _tc:
+                    return terminal_node_name[_tc[cell]]
+                if cell not in _bn:
+                    _bn[cell] = f"{_name}_n{len(_bn) + 1}"
+                return _bn[cell]
+
+            for cell_a, cell_b, layer_len, length in edges:
+                na = node_of(cell_a)
+                nb = node_of(cell_b)
+                r_total = self._terminal_resistance(net, layer_len)
+                c_total = self._edge_capacitance(net, layer_len)
+                mid = f"{name}_t{t_idx}"
+                t_idx += 1
+                lines.append(f"R{r_idx} {na} {mid} {r_total / 2:.4f}m")
+                r_idx += 1
+                lines.append(f"R{r_idx} {mid} {nb} {r_total / 2:.4f}m")
+                r_idx += 1
+                lines.append(f"C{c_idx} {mid} 0 {c_total:.4f}f")
+                c_idx += 1
+
+        if not any_rc:
+            lines.append("* (配線なし)")
+
+        if self.subckt_name:
+            lines.append(".ends")
+
+        return "\n".join(lines) + "\n"
+
     def _rebuild_net_list(self):
         self._net_list.delete(0, tk.END)
         for name, net in sorted(self.nets.items()):
             prio   = f"P{net.priority}" if net.priority is not None else ""
             layer  = f"M{net.forced_layer+1}" if net.forced_layer is not None else ""
             ring   = "Ring" if net.is_power_ring else ""
-            badge  = " ".join(filter(None, [ring, prio, layer]))
+            widthb = f"W×{net.width_mult:g}" if net.width_mult != 1 else ""
+            badge  = " ".join(filter(None, [ring, prio, layer, widthb]))
             length = sum(s.length() for s in net.segments)
-            label  = f"{name} ({length})" + (f" [{badge}]" if badge else "")
+
+            if net.is_power_ring:
+                # 電源リングには容量・抵抗の追記は不要
+                label = f"{name} ({length})" + (f" [{badge}]" if badge else "")
+                self._net_list.insert(tk.END, label)
+                continue
+
+            cap   = self._net_capacitance(net)
+            label = f"{name} ({length}, {cap:.2f}fF)" + (f" [{badge}]" if badge else "")
             self._net_list.insert(tk.END, label)
+
+            n_terms = len(net.terminal_paths)
+            for i, (comp, nn, layer_len, term_len) in enumerate(net.terminal_paths):
+                res = self._terminal_resistance(net, layer_len)
+                branch = "└─" if i == n_terms - 1 else "├─"
+                sub = f"  {branch} {name} - {comp.inst_name}.{nn} ({term_len}, {res:.2f}mΩ)"
+                self._net_list.insert(tk.END, sub)
 
     def _on_net_select(self, _):
         sel = self._net_list.curselection()
         if not sel:
             return
-        txt = self._net_list.get(sel[0])
-        net_name = txt.split()[0]
+        txt = self._net_list.get(sel[0]).strip()
+        if txt.startswith(('├', '└')):
+            # インデントされた端子別サブ行: "├─ NetName - Comp.Pin (…)"
+            net_name = txt.lstrip('├└─').strip().split(' - ', 1)[0].strip()
+        else:
+            net_name = txt.split()[0]
         self._highlight_net(net_name)
 
     def _highlight_net(self, name):
@@ -698,17 +947,30 @@ class LayoutApp:
                 return (2, 0, 0, net.name)
 
         for net in sorted(self.nets.values(), key=net_sort_key):
+            net.terminal_paths      = []
+            net.tree_root_cell      = None
+            net.tree_parent         = {}
+            net.tree_terminal_cells = {}
             if net.is_power_ring or len(net.connections) < 2:
                 continue
             pins = self._pin_positions(net)
             if not pins:
                 continue
-            segs = self._route_astar(net, pins, blocked3d, nl, max_c, max_r)
+            segs, terminal_paths, parent, terminal_cells, root_cell = \
+                self._route_astar(net, pins, blocked3d, nl, max_c, max_r)
             segs = merge_segments(segs)
             _commit(net, segs)
+            net.terminal_paths      = terminal_paths
+            net.tree_root_cell      = root_cell
+            net.tree_parent         = parent
+            net.tree_terminal_cells = terminal_cells
 
     def _pin_positions(self, net):
-        """[(col, row, layer_idx), …]  — respects net.forced_layer."""
+        """[(Component, net_name, col, row, layer_idx), …]  — respects net.forced_layer。
+        ネットに対応するポート（.subckt ピン）があれば，それを経路のルート（先頭）にする。
+        端子間の長さ・抵抗はこのルートからの距離として計算されるため，
+        ポートを持つネットは「ポートから各素子端子までの距離」という自然な意味になる。
+        """
         result = []
         for comp, nn in net.connections:
             pos = comp.pin_gpos(nn)
@@ -722,7 +984,13 @@ class LayoutApp:
                 if pd:
                     m = re.match(r'M(\d+)', pd.layer)
                     if m: l = int(m.group(1)) - 1
-            result.append((pos[0], pos[1], l))
+            result.append((comp, nn, pos[0], pos[1], l))
+
+        for i, entry in enumerate(result):
+            if entry[0].is_port:
+                if i != 0:
+                    result.insert(0, result.pop(i))
+                break
         return result
 
     def _route_astar(self, net, pins, blocked3d, nl, max_c, max_r):
@@ -733,15 +1001,31 @@ class LayoutApp:
         任意のセルから分岐できるため，途中のピンで遠回りにならず配線長が短くなる。
         forced_layer で失敗した場合はレイヤー制約を外して再試行する。
         それでも失敗した場合はそのセグメントを未配線のままにする（短絡を生まない）。
+
+        戻り値: (segs, terminal_paths, parent, terminal_cells, root_cell)
+          terminal_paths = [(Component, net_name, {layer_idx: length}, total_length), …]
+          ルート（pins[0]）からその端子までの経路の，レイヤー別長さ内訳。
+          抵抗・容量の値そのものは持たず（設定変更時に再配線せず再計算できるよう），
+          ジオメトリのみを保持する。
+          parent = {(col,row,layer): 親セル（ルートは None）} — ツリー全体の親子関係。
+          terminal_cells = {(col,row,layer): (Component, net_name)} — ルートを含む
+          各端子のセル位置（ネットリスト出力時の分岐点検出・ノード命名に使用）。
         """
         segs = []
         fl   = net.forced_layer
         eff  = self._blocked_for_net(net.name, blocked3d)
 
-        x0, y0, l0 = pins[0]
-        tree_cells = {(x0, y0, l0)}   # ツリーに属する (col,row,layer) の集合
+        root_comp, root_nn, x0, y0, l0 = pins[0]
+        root_cell = (x0, y0, l0)
+        tree_cells = {root_cell}   # ツリーに属する (col,row,layer) の集合
+        root_len   = {root_cell: 0}
+        root_layer_len = {root_cell: {}}   # layer_idx -> 累積長
+        parent = {root_cell: None}
+        terminal_cells = {root_cell: (root_comp, root_nn)}
 
-        for x1, y1, l1 in pins[1:]:
+        terminal_paths = []
+
+        for comp, nn, x1, y1, l1 in pins[1:]:
             sources = list(tree_cells)
 
             # ── 第1試行: forced_layer を守って A* ──────────────────────────
@@ -758,9 +1042,31 @@ class LayoutApp:
 
             if path is not None:
                 segs.extend(path_to_segments(path, net.name))
-                tree_cells.update(path)
-            # path が None のままなら短絡を避けるため未配線のまま
-        return segs
+
+                cur_len   = root_len.get(path[0], 0)
+                cur_layer = dict(root_layer_len.get(path[0], {}))
+                for k in range(len(path) - 1):
+                    _, _, lyr1 = path[k]
+                    _, _, lyr2 = path[k + 1]
+                    # ビア（レイヤー間移動）は「長さ」に含めない
+                    # （path_to_segments もビア区間はセグメント化しないため，
+                    #   ネット合計長の集計と単位を揃える）
+                    if lyr1 == lyr2:
+                        cur_len += 1
+                        cur_layer[lyr1] = cur_layer.get(lyr1, 0) + 1
+                    cell = path[k + 1]
+                    if cell not in root_len or cur_len < root_len[cell]:
+                        root_len[cell] = cur_len
+                        root_layer_len[cell] = dict(cur_layer)
+                        parent[cell] = path[k]
+                    tree_cells.add(cell)
+
+                dst_cell = (x1, y1, l1)
+                terminal_paths.append(
+                    (comp, nn, dict(root_layer_len[dst_cell]), root_len[dst_cell]))
+                terminal_cells[dst_cell] = (comp, nn)
+            # path が None のままなら短絡を避けるため未配線のまま（経路情報も記録しない）
+        return segs, terminal_paths, parent, terminal_cells, root_cell
 
     def _power_ring_layer(self, net, ring_idx, total):
         """パワーリングのレイヤーを決定する（上位レイヤーから割当）。"""
@@ -1161,6 +1467,10 @@ class LayoutApp:
         menu.add_command(label=ring_label,
                          command=lambda: self._toggle_power_ring(net_name))
 
+        menu.add_separator()
+        menu.add_command(label=f"配線幅を設定…（現在 ×{net.width_mult:g}）",
+                         command=lambda: self._set_width(net_name))
+
         menu.tk_popup(event.x_root, event.y_root)
 
     # ── group menu ───────────────────────────────────────────────────────────
@@ -1266,6 +1576,19 @@ class LayoutApp:
         self._reroute_and_redraw()
         state = "有効（パワーリング）" if net.is_power_ring else "無効（通常配線）"
         self._status.set(f"Net '{net_name}' → {state}")
+
+    def _set_width(self, net_name):
+        net = self.nets[net_name]
+        v = simpledialog.askfloat(
+            "配線幅設定",
+            f"ネット '{net_name}' の配線幅（デフォルト幅の何倍か）を入力:",
+            initialvalue=net.width_mult, minvalue=0.1, parent=self.root)
+        if v is not None:
+            net.width_mult = v
+            # 配線の経路（ジオメトリ）自体は変わらないため再配線は不要。
+            # 抵抗・容量の表示のみ更新する。
+            self._rebuild_net_list()
+            self._status.set(f"Net '{net_name}' 配線幅 → ×{v:g}")
 
     # ── component / group transform ──────────────────────────────────────────
 
@@ -1412,21 +1735,41 @@ class SettingsDialog(tk.Toplevel):
                     width=8).grid(row=row, column=1, padx=6)
 
         row += 1
-        ttk.Label(self, text="Layer colors:").grid(row=row, column=0,
-            columnspan=2, padx=10, pady=(8,2), sticky='w')
-
-        self._color_btns = []
-        for i in range(6):
-            row += 1
-            color = app.layer_colors[i] if i < len(app.layer_colors) else '#aaaaaa'
-            b = tk.Button(self, text=f'  M{i+1}  ', bg=color, fg='white',
-                          relief=tk.GROOVE,
-                          command=lambda idx=i: self._pick(idx))
-            b.grid(row=row, column=0, columnspan=2, padx=20, pady=1, sticky='ew')
-            self._color_btns.append(b)
+        ttk.Label(self, text="Layer colors / R (mΩ/grid) / C (fF/grid):").grid(
+            row=row, column=0, columnspan=5, padx=10, pady=(8,2), sticky='w')
 
         row += 1
-        bf = ttk.Frame(self); bf.grid(row=row, column=0, columnspan=2, pady=10)
+        ttk.Label(self, text="Layer").grid(row=row, column=0, sticky='w', padx=20)
+        ttk.Label(self, text="R(mΩ)").grid(row=row, column=1, columnspan=2)
+        ttk.Label(self, text="C(fF)").grid(row=row, column=3, columnspan=2)
+
+        self._color_btns = []
+        self._res_vars   = []
+        self._cap_vars   = []
+        for i in range(6):
+            row += 1
+            color   = app.layer_colors[i] if i < len(app.layer_colors) else '#aaaaaa'
+            res_val = app.layer_resistance[i]  if i < len(app.layer_resistance)  else 0.0
+            cap_val = app.layer_capacitance[i] if i < len(app.layer_capacitance) else 0.0
+
+            b = tk.Button(self, text=f'M{i+1}', bg=color, fg='white', width=6,
+                          relief=tk.GROOVE,
+                          command=lambda idx=i: self._pick(idx))
+            b.grid(row=row, column=0, padx=(20, 4), pady=1, sticky='ew')
+            self._color_btns.append(b)
+
+            rv = tk.DoubleVar(value=res_val)
+            ttk.Entry(self, textvariable=rv, width=7).grid(
+                row=row, column=1, columnspan=2, padx=4)
+            self._res_vars.append(rv)
+
+            cv = tk.DoubleVar(value=cap_val)
+            ttk.Entry(self, textvariable=cv, width=7).grid(
+                row=row, column=3, columnspan=2, padx=(4, 10))
+            self._cap_vars.append(cv)
+
+        row += 1
+        bf = ttk.Frame(self); bf.grid(row=row, column=0, columnspan=5, pady=10)
         ttk.Button(bf, text="適用", command=self._apply).pack(side=tk.LEFT, padx=6)
         ttk.Button(bf, text="閉じる", command=self.destroy).pack(side=tk.LEFT, padx=6)
 
@@ -1444,6 +1787,21 @@ class SettingsDialog(tk.Toplevel):
         self.app.num_layers = max(1, min(6, self._nl.get()))
         self.app._gs_var.set(self.app.grid_px)
         self.app._nl_var.set(self.app.num_layers)
+
+        for i in range(6):
+            while len(self.app.layer_resistance) <= i:
+                self.app.layer_resistance.append(0.0)
+            while len(self.app.layer_capacitance) <= i:
+                self.app.layer_capacitance.append(0.0)
+            try:
+                self.app.layer_resistance[i] = max(0.0, self._res_vars[i].get())
+            except tk.TclError:
+                pass
+            try:
+                self.app.layer_capacitance[i] = max(0.0, self._cap_vars[i].get())
+            except tk.TclError:
+                pass
+
         self.app._build_color_buttons()
         self.app._reroute_and_redraw()
         self.destroy()
