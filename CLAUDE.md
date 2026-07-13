@@ -67,7 +67,7 @@ X4 VDD GND D E BUF_X1  * W=6 H=4 VDD:N:M1 GND:S:M1 D:W:M1 E:E:M1
 |--------|------|
 | `PinDef` | ピン1個の情報（名前・配置辺・レイヤー） |
 | `Component` | 素子インスタンス（位置・サイズ・ピン群）。`is_port=True` の場合はサブサーキットの I/O ピン（ポート）インスタンス |
-| `Net` | ネット（接続リスト・優先度・強制レイヤー・パワーリングフラグ） |
+| `Net` | ネット（接続リスト・優先度・強制レイヤー・パワーリングフラグ・`width_mult`・`terminal_paths`・配線ツリー`tree_root_cell`/`tree_parent`/`tree_terminal_cells`） |
 | `RouteSegment` | 配線セグメント1本（始点・終点・レイヤー・ネット名・`kind`） |
 | `ComponentGroup` | 素子グループ（`gid` 連番・`members` リスト） |
 
@@ -75,7 +75,7 @@ X4 VDD GND D E BUF_X1  * W=6 H=4 VDD:N:M1 GND:S:M1 D:W:M1 E:E:M1
 
 | 関数/メソッド | 役割 |
 |--------------|------|
-| `parse_netlist(text)` | SPICE テキストを解析して `components`, `nets`, `subckt_name` を返す（`.subckt` ピンはポート `Component` として `components` に含む） |
+| `parse_netlist(text)` | SPICE テキストを解析して `components`, `nets`, `subckt_name`, `port_names` を返す（`.subckt` ピンはポート `Component` として `components` に含む） |
 | `initial_placement(components)` | 素子を左→右・上→下の格子状に初期配置 |
 | `astar_route(sources, dst, ...)` | 3D グリッド（col × row × layer）上のマルチソース A* 最短経路探索（`sources` は複数の (col,row,layer) 開始点） |
 | `path_to_segments(path, net_name)` | A* パスを `RouteSegment` リストに変換 |
@@ -83,7 +83,12 @@ X4 VDD GND D E BUF_X1  * W=6 H=4 VDD:N:M1 GND:S:M1 D:W:M1 E:E:M1
 | `LayoutApp._build_pin_occupation()` | ピン位置の層ブロックマップを構築 |
 | `LayoutApp._route_all()` | 全ネットを優先度順に配線（パワーリング優先） |
 | `LayoutApp._route_power_ring(...)` | パワーリング（矩形リング＋各ピンからのコネクタ）を生成 |
-| `LayoutApp._route_astar(...)` | 信号線の配線。ピンを1本ずつ「成長するツリー」へ接続（Steiner ツリー風の枝分かれ，forced_layer 対応・フォールバック再試行） |
+| `LayoutApp._route_astar(...)` | 信号線の配線。ピンを1本ずつ「成長するツリー」へ接続（Steiner ツリー風の枝分かれ，forced_layer 対応・フォールバック再試行）。戻り値に各端子までのレイヤー別長さ内訳（`terminal_paths`）を含む |
+| `LayoutApp._net_capacitance(net)` | ネット全体の容量[fF]を `net.segments` から計算（電源リング本体は除外） |
+| `LayoutApp._terminal_resistance(net, layer_len)` | ルートから1端子までの経路の抵抗[mΩ]を計算 |
+| `_find_branch_cells(parent)` | 配線ツリーの分岐点（次数3以上のセル）を検出（モジュールレベル） |
+| `_decompose_tree_edges(root_cell, parent, special_cells)` | ツリーを端子/分岐点間の最小限の辺に分解（モジュールレベル） |
+| `LayoutApp._generate_annotated_netlist()` | 配線寄生R/C（T型等価回路）を追加したSPICEネットリスト文字列を生成 |
 | `LayoutApp._check_layer_conflicts()` | 短絡（同層・同セル重複）を検出 |
 | `LayoutApp._comp_group(comp)` | 素子が属するグループを返す（なければ `None`） |
 | `LayoutApp._create_group()` | `_multi_sel` の素子から新規グループを作成 |
@@ -128,6 +133,86 @@ _route_all() の実行順序:
 - **電源ネット（`is_power_net_name` に一致する VDD/GND 等）はポートインスタンスを生成しない**
   （`parse_netlist()` 内でスキップ）。電源リング自体が I/O の接続点に相当するため
 - ネットの他の接続が無い（宣言されているが未使用の）ポートは配線されない
+
+### 配線の抵抗・容量計算
+
+各レイヤーは色に加えて，1グリッド単位あたりの基準抵抗 `layer_resistance`[mΩ] と
+基準容量 `layer_capacitance`[fF] を持ちます（デフォルト値は `DEFAULT_LAYER_RESISTANCE` /
+`DEFAULT_LAYER_CAPACITANCE`，設定は「設定…」ダイアログの各レイヤー行で編集可能）。
+各ネットは配線幅倍率 `Net.width_mult`（デフォルト1倍）を持ち，配線上の右クリックメニュー
+「配線幅を設定…」から変更できます。
+
+```
+抵抗 = 基準抵抗 × 長さ / 配線幅
+容量 = 基準容量 × 長さ × 配線幅
+```
+
+- **容量**はネット全体でひとつの値（`_net_capacitance`）。`net.segments`（電源リング本体
+  `kind='power_ring'` を除く）を対象に，セグメントごとそのレイヤーの基準容量で計算して合計する。
+  ジオメトリ（`net.segments`）と現在の設定値から都度計算するため，レイヤー設定や配線幅を
+  変更しても再配線なしで即座に反映される。
+- **抵抗**は端子ごと（ネットの「ルート」から各端子までの経路）に計算する。
+  ルートは，そのネットに対応する `.subckt` ポート（`is_port=True`）があればそれ，
+  なければ最初に接続された素子ピン（`_pin_positions()` が並べ替える。詳細は
+  「サブサーキットポート」節参照）。`_route_astar()` がツリー成長時に，各セルまでの
+  「ルートからの累積長のレイヤー別内訳」（`root_layer_len`）を記録し，ネット単位で
+  `net.terminal_paths = [(Component, net_name, {layer_idx: length}, total_length), …]`
+  （ルート自身は含まない）として保持する。表示時に `_terminal_resistance()` で現在の
+  `layer_resistance` / `width_mult` を使って再計算するため，ここも設定変更だけなら再配線不要。
+  ビア（レイヤー間移動）区間は長さにも抵抗にも加算しない（`net.segments` ベースの
+  ネット合計長と単位を揃えるため。層またぎ区間は0Ω区間として単純化）。
+- **電源リングには適用しない**：`net.is_power_ring` のネットは容量・抵抗ともに表示・計算
+  対象外（リング自体がピンに相当するため）。
+
+左ペインのネット一覧（`_rebuild_net_list`）は以下の形式で表示されます。
+
+```
+A (長さ, 容量値fF) [バッジ]
+  ├─ A - X1.A (長さ, 抵抗値mΩ)
+  └─ A - X3.A (長さ, 抵抗値mΩ)
+```
+
+端子ラベルは `素子名.ネット名`（例 `X3.A`）形式。罫線（`├─`/`└─`，最後の項目だけ `└─`）
+で階層を表す。ルート端子自身は長さ0の自明な行になるため一覧から除外し，
+それ以外の端子だけを列挙する。ネット一覧クリック時のハイライト（`_on_net_select`）は
+サブ行（`├`/`└` で始まる行）も解析してネット名を取り出せるようにしてある。
+
+### 配線ツリーの分岐点分解とSPICEネットリスト出力
+
+`_route_astar()` は上記の累積長トラッキングに加えて，ネット全体の配線を1本の木構造
+として保持する（`net.tree_root_cell`＝ルートのセル，`net.tree_parent`＝各セルの親セル
+の辞書，`net.tree_terminal_cells`＝ルートを含む各端子のセル位置）。
+
+`_find_branch_cells(parent)` は無向木としての次数が3以上のセル（配線が分岐する点）を
+検出し，`_decompose_tree_edges(root_cell, parent, special_cells)` はルートから木を
+たどり，端子または分岐点どうしを結ぶ最小限の「辺」に分解する
+（`[(cellA, cellB, {layer_idx: length}, total_length), …]`）。1本の辺が
+T型等価回路1個に対応する。どちらも `layout_planner.py` のモジュールレベル関数
+（`LayoutApp` に依存しない純粋なグラフ処理）で，再帰ではなく明示的スタックを使う
+イテレーティブ実装（大規模ネットでの再帰上限超過を避けるため）。
+
+`LayoutApp._generate_annotated_netlist()` はこの分解結果から，配線寄生 R/C を
+T型等価回路として追加した SPICE ネットリストのテキストを生成する
+（Route メニュー → 「配線結果をSPICEネットリスト出力…」）。
+R/C 要素は `.subckt` ブロック内，`.ends` の手前に出力する（サブサーキットの
+内部素子として扱うため）。
+
+- **ノード命名**：各ネットの「ルート」端子（`.subckt` ポートがあればそれ，なければ
+  最初に接続された素子ピン）は元のネット名のまま。それ以外の素子端子は，配線抵抗で
+  電気的に切り離されるため `ネット名_素子名` という新しいノード名に張り替える
+  （X 行の該当ピンの接続先もこの名前に書き換えて再生成する）。分岐点は
+  `ネット名_nK`，各辺の T型中点ノードは `ネット名_tK`。
+  電源リングはノード名を変更せず，R/C 要素も出力しない。
+- **単位**：内部の抵抗値[mΩ]・容量値[fF]は，そのまま SPICE の `m`（ミリ）/ `f`
+  （フェムト）接尾辞に対応するため，単位変換なしに `750.0000m`・`14.0000f` の
+  ように接尾辞を付けるだけで正しい値になる。
+- ポートインスタンス（`is_port=True`）自体は実素子ではないため X 行としては出力しない。
+- 出力例（T型1辺）:
+  ```
+  R1 A A_t1 50.0000m
+  R2 A_t1 A_n1 50.0000m
+  C1 A_t1 0 4.0000f
+  ```
 
 ### 回転・反転の座標変換
 
@@ -182,10 +267,12 @@ _route_all() の実行順序:
 | 右クリック（配線上） | 配線コンテキストメニュー表示 |
 | &nbsp;├ 優先度を設定 | 数値が小さいほど高優先度で最短配線 |
 | &nbsp;├ 配線レイヤーを変更 | レイヤーを固定 → 再配線 → 短絡チェック |
-| &nbsp;└ パワーリングとして配線 | パワーリングモードのトグル |
+| &nbsp;├ パワーリングとして配線 | パワーリングモードのトグル |
+| &nbsp;└ 配線幅を設定 | ネットの配線幅倍率を設定（デフォルト1倍。抵抗・容量の計算に反映） |
 | Ctrl + ホイール | ズームイン／アウト |
 | ホイール | スクロール |
 | ネット一覧クリック | 選択ネットをハイライト |
+| メニュー: Route → 配線結果をSPICEネットリスト出力… | 配線寄生R/C付きネットリストをテキスト表示（保存も可能） |
 
 ### 回転・反転ボタン（左パネル）
 
@@ -207,8 +294,12 @@ _route_all() の実行順序:
 | Grid (px) | グリッド間隔（ピクセル，8〜80） |
 | Layers | 配線層数（1〜6） |
 | Layer colors | 各層の表示色（クリックでカラーピッカー） |
+| Layer R (mΩ/grid) | 各層の1グリッドあたり基準抵抗（「設定…」ダイアログのみ） |
+| Layer C (fF/grid) | 各層の1グリッドあたり基準容量（「設定…」ダイアログのみ） |
 
-`LayoutApp` の属性として保持されます（`grid_px`, `num_layers`, `layer_colors`, `ring_margin`）。
+`LayoutApp` の属性として保持されます（`grid_px`, `num_layers`, `layer_colors`,
+`layer_resistance`, `layer_capacitance`, `ring_margin`）。
+ネットごとの配線幅倍率（`Net.width_mult`）は配線の右クリックメニューから個別に設定します。
 
 ## パワーリングの自動検出
 
